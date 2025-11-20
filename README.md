@@ -2,6 +2,15 @@
 
 Python daemon that uploads files from a local directory to S3 once they have stayed stable for a configurable period. Uploaded keys are tracked in SQLite so files are never resent, and stale local files are deleted only after S3 confirms they exist.
 
+## Configure
+
+1. Copy the example configuration and edit it with your values:
+   ```bash
+   cp config.example.ini config.ini
+   $EDITOR config.ini
+   ```
+2. Ensure the `directory_to_watch` exists locally and that your AWS credentials (environment variables or shared config) have read/write access to the bucket.
+
 ## Run Inside a Virtual Environment
 
 1. Create and activate a virtual environment (any name works):
@@ -13,8 +22,7 @@ Python daemon that uploads files from a local directory to S3 once they have sta
    ```bash
    pip install -r requirements.txt
    ```
-3. Fill out `config.ini` with your watch directory and S3 bucket (sample values are provided).
-4. Launch the uploader while the virtualenv is active:
+3. Launch the uploader while the virtualenv is active:
    ```bash
    python s3_uploader.py
    ```

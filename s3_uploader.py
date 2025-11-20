@@ -16,9 +16,11 @@ import sqlite3
 import configparser
 import threading
 
-from collections import Counter
+from collections import Counter, OrderedDict
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from typing import Iterable, Optional
 
 import boto3
 import botocore.exceptions
@@ -30,29 +32,106 @@ import botocore.exceptions
 
 CONFIG_FILE = "config.ini"
 
-config = configparser.ConfigParser()
-read_files = config.read(CONFIG_FILE)
-if not read_files:
-    raise RuntimeError(f"{CONFIG_FILE} not found")
 
-try:
-    RUNNING_INTERVAL = int(config["settings"]["running_interval"])
-    CLEANUP_INTERVAL = int(config["settings"]["cleanup_interval"])
-    LOG_PATH = config["settings"]["log_path"]
-    UPLOADED_FILES_DB = config["settings"]["uploaded_files_db"]
-    # Optional tunables
-    STABLE_FILE_AGE = int(config["settings"].get("stable_file_age", 30))       # seconds
-    CLEANUP_FILE_AGE = int(config["settings"].get("cleanup_file_age", 3600))   # seconds
-    UPLOAD_WORKERS = max(1, int(config["settings"].get("upload_workers", 4)))
-    MAX_S3_RETRIES = max(1, int(config["settings"].get("max_s3_retries", 3)))
-    S3_RETRY_BASE_DELAY = float(config["settings"].get("s3_retry_base_delay", 1.0))
-    S3_LIST_PAGE_SIZE = max(1, int(config["settings"].get("s3_list_page_size", 1000)))
+@dataclass
+class AppSettings:
+    running_interval: int
+    cleanup_interval: int
+    log_path: str
+    uploaded_files_db: str
+    stable_file_age: int
+    cleanup_file_age: int
+    upload_workers: int
+    max_s3_retries: int
+    s3_retry_base_delay: float
+    s3_list_page_size: int
+    bucket_name: str
+    directory_to_watch: str
+    storage_class: str
+    max_pending_uploads: int
+    cleanup_batch_size: int
+    cleanup_prefix_batch_size: int
 
-    BUCKET_NAME = config["aws"]["bucket_name"]
-    DIRECTORY_TO_WATCH = config["aws"]["directory_to_watch"]
-    STORAGE_CLASS = config["aws"].get("storage_class", "STANDARD")
-except KeyError as e:
-    raise RuntimeError(f"Missing config key: {e}")
+
+def _read_config() -> configparser.ConfigParser:
+    parser = configparser.ConfigParser()
+    read_files = parser.read(CONFIG_FILE)
+    if not read_files:
+        raise RuntimeError(f"{CONFIG_FILE} not found")
+    return parser
+
+
+def _load_settings(parser: configparser.ConfigParser) -> AppSettings:
+    try:
+        settings_section = parser["settings"]
+        aws_section = parser["aws"]
+    except KeyError as exc:
+        raise RuntimeError(f"Missing config section: {exc}") from exc
+
+    def get_required(section, key):
+        value = section.get(key)
+        if value is None:
+            raise RuntimeError(f"Missing config key: {key}")
+        return value
+
+    running_interval = settings_section.getint("running_interval", fallback=120)
+    cleanup_interval = settings_section.getint("cleanup_interval", fallback=172800)
+    log_path = get_required(settings_section, "log_path")
+    uploaded_files_db = get_required(settings_section, "uploaded_files_db")
+    stable_file_age = settings_section.getint("stable_file_age", fallback=30)
+    cleanup_file_age = settings_section.getint("cleanup_file_age", fallback=3600)
+    upload_workers = max(1, settings_section.getint("upload_workers", fallback=4))
+    max_s3_retries = max(1, settings_section.getint("max_s3_retries", fallback=3))
+    s3_retry_base_delay = settings_section.getfloat("s3_retry_base_delay", fallback=1.0)
+    s3_list_page_size = max(1, settings_section.getint("s3_list_page_size", fallback=1000))
+    max_pending_uploads = max(
+        upload_workers,
+        settings_section.getint("max_pending_uploads", fallback=200),
+    )
+    cleanup_batch_size = max(1, settings_section.getint("cleanup_batch_size", fallback=200))
+    cleanup_prefix_batch_size = max(
+        1,
+        settings_section.getint("cleanup_prefix_batch_size", fallback=25),
+    )
+
+    bucket_name = get_required(aws_section, "bucket_name")
+    directory_to_watch = get_required(aws_section, "directory_to_watch")
+    storage_class = aws_section.get("storage_class", "STANDARD")
+
+    return AppSettings(
+        running_interval=running_interval,
+        cleanup_interval=cleanup_interval,
+        log_path=log_path,
+        uploaded_files_db=uploaded_files_db,
+        stable_file_age=stable_file_age,
+        cleanup_file_age=cleanup_file_age,
+        upload_workers=upload_workers,
+        max_s3_retries=max_s3_retries,
+        s3_retry_base_delay=s3_retry_base_delay,
+        s3_list_page_size=s3_list_page_size,
+        bucket_name=bucket_name,
+        directory_to_watch=directory_to_watch,
+        storage_class=storage_class,
+        max_pending_uploads=max_pending_uploads,
+        cleanup_batch_size=cleanup_batch_size,
+        cleanup_prefix_batch_size=cleanup_prefix_batch_size,
+    )
+
+
+SETTINGS = _load_settings(_read_config())
+CONFIG_MTIME = os.path.getmtime(CONFIG_FILE)
+IMMUTABLE_FIELDS = {
+    "log_path",
+    "uploaded_files_db",
+    "upload_workers",
+    "bucket_name",
+    "directory_to_watch",
+}
+CONFIG_RELOAD_LOCK = threading.Lock()
+
+
+def get_settings() -> AppSettings:
+    return SETTINGS
 
 
 # ----------------------------
@@ -66,12 +145,12 @@ def _ensure_parent_dir(path: str) -> None:
         os.makedirs(parent, exist_ok=True)
 
 
-_ensure_parent_dir(LOG_PATH)
+_ensure_parent_dir(SETTINGS.log_path)
 
 logger = logging.getLogger("s3_uploader")
 logger.setLevel(logging.INFO)
 
-file_handler = logging.FileHandler(LOG_PATH)
+file_handler = logging.FileHandler(SETTINGS.log_path)
 file_handler.setFormatter(
     logging.Formatter("%(asctime)s %(levelname)s %(message)s")
 )
@@ -83,6 +162,41 @@ console_handler.setFormatter(
     logging.Formatter("%(asctime)s %(levelname)s %(message)s")
 )
 logger.addHandler(console_handler)
+
+
+def maybe_reload_settings() -> None:
+    """Reload config.ini when it changes on disk."""
+    global SETTINGS, CONFIG_MTIME
+
+    with CONFIG_RELOAD_LOCK:
+        try:
+            mtime = os.path.getmtime(CONFIG_FILE)
+        except FileNotFoundError:
+            logger.error("Config file %s disappeared; keeping previous settings", CONFIG_FILE)
+            return
+
+        if mtime <= CONFIG_MTIME:
+            return
+
+        parser = _read_config()
+        new_settings = _load_settings(parser)
+        immutable_changes = [
+            field
+            for field in IMMUTABLE_FIELDS
+            if getattr(new_settings, field) != getattr(SETTINGS, field)
+        ]
+        for field in immutable_changes:
+            setattr(new_settings, field, getattr(SETTINGS, field))
+
+        if immutable_changes:
+            logger.warning(
+                "Ignoring runtime changes to immutable config options: %s (restart required)",
+                ", ".join(sorted(immutable_changes)),
+            )
+
+        SETTINGS = new_settings
+        CONFIG_MTIME = mtime
+        logger.info("Reloaded configuration from %s", CONFIG_FILE)
 
 
 # ----------------------------
@@ -168,9 +282,12 @@ def should_retry_exception(exc: Exception) -> bool:
     return isinstance(exc, botocore.exceptions.BotoCoreError)
 
 
-def retry_with_backoff(operation, description: str, max_attempts: int = MAX_S3_RETRIES):
+def retry_with_backoff(operation, description: str, settings: AppSettings, max_attempts: Optional[int] = None):
     """Execute a callable with exponential backoff on retryable exceptions."""
-    delay = S3_RETRY_BASE_DELAY
+    if max_attempts is None:
+        max_attempts = settings.max_s3_retries
+
+    delay = settings.s3_retry_base_delay
     attempt = 1
 
     while True:
@@ -193,11 +310,12 @@ def retry_with_backoff(operation, description: str, max_attempts: int = MAX_S3_R
 # S3 helpers
 # ----------------------------
 
-def s3_object_exists(s3_client, bucket_name: str, key: str) -> bool:
+def s3_object_exists(s3_client, bucket_name: str, key: str, settings: AppSettings) -> bool:
     try:
         retry_with_backoff(
             lambda: s3_client.head_object(Bucket=bucket_name, Key=key),
             description=f"head_object for {key}",
+            settings=settings,
         )
         return True
     except botocore.exceptions.ClientError as e:
@@ -208,7 +326,12 @@ def s3_object_exists(s3_client, bucket_name: str, key: str) -> bool:
         raise
 
 
-def fetch_existing_keys_by_prefixes(s3_client, bucket_name: str, prefixes) -> dict:
+def fetch_existing_keys_by_prefixes(
+    s3_client,
+    bucket_name: str,
+    prefixes,
+    settings: AppSettings,
+) -> dict:
     """Return a map of prefix -> keys present in S3 for the given prefixes."""
     keys_by_prefix = {}
     for prefix in prefixes:
@@ -221,7 +344,7 @@ def fetch_existing_keys_by_prefixes(s3_client, bucket_name: str, prefixes) -> di
                     params = {
                         "Bucket": bucket_name,
                         "Prefix": prefix,
-                        "MaxKeys": S3_LIST_PAGE_SIZE,
+                        "MaxKeys": settings.s3_list_page_size,
                     }
                     if continuation_token:
                         params["ContinuationToken"] = continuation_token
@@ -230,6 +353,7 @@ def fetch_existing_keys_by_prefixes(s3_client, bucket_name: str, prefixes) -> di
                 response = retry_with_backoff(
                     execute_request,
                     description=f"list_objects_v2 for prefix {prefix}",
+                    settings=settings,
                 )
 
                 for obj in response.get("Contents", []):
@@ -289,6 +413,20 @@ def is_stable_file(file_path: str, min_age_seconds: int) -> bool:
     return age >= min_age_seconds
 
 
+def iter_watched_files(directory: str) -> Iterable[str]:
+    """
+    Yield files under the directory recursively, skipping hidden dirs/files.
+    """
+    for root, dirs, files in os.walk(directory):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for file_name in files:
+            if file_name.startswith("."):
+                continue
+            file_path = os.path.join(root, file_name)
+            if os.path.isfile(file_path):
+                yield file_path
+
+
 # ----------------------------
 # Core logic
 # ----------------------------
@@ -299,13 +437,14 @@ def upload_file_to_s3(
     s3_client,
     db_conn: sqlite3.Connection,
     stats: UploadStats,
+    settings: AppSettings,
 ) -> None:
     try:
         if not os.path.isfile(file_path):
             return
 
         # Only upload stable files
-        if not is_stable_file(file_path, STABLE_FILE_AGE):
+        if not is_stable_file(file_path, settings.stable_file_age):
             return
 
         s3_key = get_s3_key_for_file(file_path)
@@ -316,7 +455,7 @@ def upload_file_to_s3(
             return
 
         # Double check against S3 to avoid overwriting existing object
-        if s3_object_exists(s3_client, bucket_name, s3_key):
+        if s3_object_exists(s3_client, bucket_name, s3_key, settings):
             # Ensure DB is consistent with reality
             record_uploaded_file(db_conn, s3_key, file_path)
             stats.increment("skipped_s3")
@@ -328,18 +467,21 @@ def upload_file_to_s3(
                 file_path,
                 bucket_name,
                 s3_key,
-                ExtraArgs={"StorageClass": STORAGE_CLASS},
+                ExtraArgs={"StorageClass": settings.storage_class},
             ),
             description=f"upload_file for {s3_key}",
+            settings=settings,
         )
         logger.info(
             f"Uploaded {file_path} to s3://{bucket_name}/{s3_key} "
-            f"with storage class {STORAGE_CLASS}"
+            f"with storage class {settings.storage_class}"
         )
 
         record_uploaded_file(db_conn, s3_key, file_path)
         stats.increment("uploaded")
 
+    except FileNotFoundError:
+        stats.increment("missing")
     except Exception as e:
         logger.error(f"Upload failed for {file_path}: {e}", exc_info=True)
         stats.increment("failed")
@@ -349,7 +491,8 @@ def cleanup_folder(
     directory: str,
     bucket_name: str,
     s3_client,
-    db_conn: sqlite3.Connection
+    db_conn: sqlite3.Connection,
+    settings: AppSettings,
 ) -> None:
     """
     Remove local files that:
@@ -360,27 +503,42 @@ def cleanup_folder(
     try:
         now = time.time()
 
-        pending_by_prefix = {}
+        pending_by_prefix = OrderedDict()
+        files_considered = 0
 
-        for file_name in os.listdir(directory):
-            file_path = os.path.join(directory, file_name)
+        for file_path in iter_watched_files(directory):
+            if files_considered >= settings.cleanup_batch_size:
+                break
 
-            if not os.path.isfile(file_path):
+            try:
+                age = now - os.path.getmtime(file_path)
+            except FileNotFoundError:
                 continue
 
-            age = now - os.path.getmtime(file_path)
-            if age < CLEANUP_FILE_AGE:
+            if age < settings.cleanup_file_age:
                 continue
 
             s3_key = get_s3_key_for_file(file_path)
 
             if has_been_uploaded(db_conn, s3_key):
-                os.remove(file_path)
-                logger.info(f"Removed local file (already uploaded): {file_path}")
+                try:
+                    os.remove(file_path)
+                except FileNotFoundError:
+                    pass
+                else:
+                    logger.info(f"Removed local file (already uploaded): {file_path}")
                 continue
 
             prefix = _prefix_for_s3_key(s3_key)
+
+            if (
+                prefix not in pending_by_prefix
+                and len(pending_by_prefix) >= settings.cleanup_prefix_batch_size
+            ):
+                continue
+
             pending_by_prefix.setdefault(prefix, []).append((file_path, s3_key))
+            files_considered += 1
 
         if not pending_by_prefix:
             return
@@ -389,6 +547,7 @@ def cleanup_folder(
             s3_client,
             bucket_name,
             pending_by_prefix.keys(),
+            settings,
         )
 
         for prefix, file_entries in pending_by_prefix.items():
@@ -396,7 +555,10 @@ def cleanup_folder(
             for file_path, s3_key in file_entries:
                 if s3_key in known_keys:
                     record_uploaded_file(db_conn, s3_key, file_path)
-                    os.remove(file_path)
+                    try:
+                        os.remove(file_path)
+                    except FileNotFoundError:
+                        continue
                     logger.info(
                         f"Removed local file (S3 confirms uploaded): {file_path}"
                     )
@@ -406,91 +568,105 @@ def cleanup_folder(
 
 
 def monitor_folder(
-    directory: str,
-    bucket_name: str,
     s3_client,
-    db_conn: sqlite3.Connection
+    db_conn: sqlite3.Connection,
 ) -> None:
+    settings = get_settings()
+    directory = settings.directory_to_watch
+    bucket_name = settings.bucket_name
+
     last_cleanup = datetime.now()
     stats = UploadStats()
     last_summary = {}
+    inflight_uploads = set()
 
     logger.info(
         f"Starting folder monitor. Directory={directory}, "
-        f"Bucket={bucket_name}, Interval={RUNNING_INTERVAL}s, "
-        f"Cleanup every {CLEANUP_INTERVAL}s, StorageClass={STORAGE_CLASS}"
+        f"Bucket={bucket_name}, Interval={settings.running_interval}s, "
+        f"Cleanup every {settings.cleanup_interval}s, StorageClass={settings.storage_class}, "
+        f"Workers={settings.upload_workers}"
     )
 
-    inflight_uploads = set()
-
-    with ThreadPoolExecutor(max_workers=UPLOAD_WORKERS) as executor:
+    with ThreadPoolExecutor(max_workers=settings.upload_workers) as executor:
         while True:
             try:
-                # Upload new / changed files
-                for file_name in os.listdir(directory):
-                    # Ignore hidden / temp files if you want
-                    if file_name.startswith("."):
-                        continue
+                maybe_reload_settings()
+                settings = get_settings()
+                directory = settings.directory_to_watch
+                bucket_name = settings.bucket_name
 
-                    file_path = os.path.join(directory, file_name)
-
-                    if os.path.isfile(file_path):
-                        future = executor.submit(
-                            upload_file_to_s3,
-                            file_path,
-                            bucket_name,
-                            s3_client,
-                            db_conn,
-                            stats,
-                        )
-                        inflight_uploads.add(future)
-
-                # Clean up completed futures so the set doesn't grow forever
+                # Clean completed futures so queue length reflects in-flight uploads
                 inflight_uploads = {f for f in inflight_uploads if not f.done()}
+                pending_capacity = max(settings.max_pending_uploads - len(inflight_uploads), 0)
 
-                # Periodic cleanup
-                if datetime.now() - last_cleanup >= timedelta(seconds=CLEANUP_INTERVAL):
-                    cleanup_folder(directory, bucket_name, s3_client, db_conn)
+                for file_path in iter_watched_files(directory):
+                    if pending_capacity <= 0:
+                        break
+
+                    future = executor.submit(
+                        upload_file_to_s3,
+                        file_path,
+                        bucket_name,
+                        s3_client,
+                        db_conn,
+                        stats,
+                        settings,
+                    )
+                    inflight_uploads.add(future)
+                    pending_capacity -= 1
+
+                if pending_capacity == 0:
+                    logger.info(
+                        "Upload queue is full (%d in flight); remaining files will be retried next cycle",
+                        len(inflight_uploads),
+                    )
+
+                if datetime.now() - last_cleanup >= timedelta(seconds=settings.cleanup_interval):
+                    cleanup_folder(directory, bucket_name, s3_client, db_conn, settings)
                     last_cleanup = datetime.now()
 
-                # Emit summary for deltas since last log so counts stay accurate
                 current_summary = stats.snapshot()
                 delta = {
                     "uploaded": current_summary.get("uploaded", 0) - last_summary.get("uploaded", 0),
                     "skipped_db": current_summary.get("skipped_db", 0) - last_summary.get("skipped_db", 0),
                     "skipped_s3": current_summary.get("skipped_s3", 0) - last_summary.get("skipped_s3", 0),
                     "failed": current_summary.get("failed", 0) - last_summary.get("failed", 0),
+                    "missing": current_summary.get("missing", 0) - last_summary.get("missing", 0),
                 }
                 if any(value > 0 for value in delta.values()):
                     logger.info(
-                        "Cycle summary: uploads=%d skipped_db=%d skipped_s3=%d failures=%d",
+                        "Cycle summary: uploads=%d skipped_db=%d skipped_s3=%d missing=%d failures=%d",
                         delta["uploaded"],
                         delta["skipped_db"],
                         delta["skipped_s3"],
+                        delta["missing"],
                         delta["failed"],
                     )
                 last_summary = current_summary
 
-                time.sleep(RUNNING_INTERVAL)
+                time.sleep(settings.running_interval)
 
             except KeyboardInterrupt:
                 logger.info("Shutting down due to KeyboardInterrupt")
                 break
             except Exception as e:
                 logger.error(f"Error in monitor loop: {e}", exc_info=True)
-                # Avoid a tight error loop
                 time.sleep(5)
 
 
 def main():
-    if not os.path.isdir(DIRECTORY_TO_WATCH):
-        raise RuntimeError(f"Directory to watch does not exist: {DIRECTORY_TO_WATCH}")
+    settings = get_settings()
 
-    db_conn = init_db(UPLOADED_FILES_DB)
+    if not os.path.isdir(settings.directory_to_watch):
+        raise RuntimeError(
+            f"Directory to watch does not exist: {settings.directory_to_watch}"
+        )
+
+    db_conn = init_db(settings.uploaded_files_db)
     s3_client = boto3.client("s3")
 
     try:
-        monitor_folder(DIRECTORY_TO_WATCH, BUCKET_NAME, s3_client, db_conn)
+        monitor_folder(s3_client, db_conn)
     finally:
         db_conn.close()
 

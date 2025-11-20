@@ -1,0 +1,22 @@
+# Copy this file to /etc/systemd/system/s3_uploader.service and edit the paths
+# and identity to match your environment.
+
+[Unit]
+Description=Local folder to S3 uploader
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/s3_uploader
+# Point ExecStart at the python binary inside your virtualenv
+ExecStart=/opt/s3_uploader/.venv/bin/python s3_uploader.py
+# Export AWS credentials however you normally do (env vars, profile, etc.)
+Environment=AWS_PROFILE=default
+User=s3uploader
+Group=s3uploader
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
